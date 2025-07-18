@@ -20,8 +20,9 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
+        id: login-ecr
+        
 
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
@@ -50,8 +51,9 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
+        id: login-ecr
+        
 
       - name: Run Docker Image to serve users
         
