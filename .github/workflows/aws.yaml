@@ -1,17 +1,20 @@
-name: CI/CD to AWS ECS
+name: CI/CD Pipeline - Deploy FastAPI to ECS
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
+  # -----------------------------
+  # 1️⃣ Build Docker Image & Push to ECR
+  # -----------------------------
   build-image:
-    name: Build and Push Docker Image
     runs-on: ubuntu-latest
     outputs:
-      image-uri: ${{ steps.build-image.outputs.image }}
+      image-uri: ${{ steps.push-image.outputs.image }}
+
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v3
 
       - name: Configure AWS Credentials
@@ -22,11 +25,11 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
         id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push Docker image
-        id: build-image
+      - name: Build, Tag & Push Docker Image
+        id: push-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
@@ -36,10 +39,15 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
+  # -----------------------------
+  # 2️⃣ Register New ECS Task Definition
+  # -----------------------------
   update-task:
-    name: Update ECS Task Definition
     needs: build-image
     runs-on: ubuntu-latest
+    outputs:
+      task-def-arn: ${{ steps.register-task.outputs.task-def-arn }}
+
     steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -48,20 +56,31 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Register new ECS task definition
+      - name: Register ECS Task Definition
         id: register-task
         env:
           IMAGE_URI: ${{ needs.build-image.outputs.image-uri }}
+          ECS_ROLE_ARN: arn:aws:iam::756810443859:role/ecsTaskExecutionRole
         run: |
+          # Fetch existing task definition
           TASK_DEF=$(aws ecs describe-task-definition --task-definition my-ecs-task)
-          NEW_TASK_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$IMAGE_URI" '.taskDefinition | .containerDefinitions[0].image=$IMAGE | {family: .family, containerDefinitions: .containerDefinitions, taskRoleArn: .taskRoleArn, executionRoleArn: .executionRoleArn, networkMode: .networkMode, requiresCompatibilities: .requiresCompatibilities, cpu: .cpu, memory: .memory}')
+          
+          # Create new task definition JSON with updated image and role
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$IMAGE_URI" --arg ROLE "$ECS_ROLE_ARN" \
+            '.taskDefinition | .containerDefinitions[0].image=$IMAGE | .executionRoleArn=$ROLE | .taskRoleArn=$ROLE | {family: .family, containerDefinitions: .containerDefinitions, taskRoleArn: .taskRoleArn, executionRoleArn: .executionRoleArn, networkMode: .networkMode, requiresCompatibilities: .requiresCompatibilities, cpu: .cpu, memory: .memory}')
+          
           echo "$NEW_TASK_DEF" > new-task-def.json
+
+          # Register updated task definition
           aws ecs register-task-definition --cli-input-json file://new-task-def.json
+
           TASK_DEF_ARN=$(aws ecs describe-task-definition --task-definition my-ecs-task --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
 
-  deploy-service:
-    name: Deploy ECS Service
+  # -----------------------------
+  # 3️⃣ Deploy to ECS Service
+  # -----------------------------
+  deploy:
     needs: update-task
     runs-on: ubuntu-latest
     steps:
@@ -72,8 +91,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Update ECS service to use new task definition
+      - name: Update ECS Service
         env:
+          ECS_CLUSTER: my-cluster
+          ECS_SERVICE: my-ecs-service
           TASK_DEF_ARN: ${{ needs.update-task.outputs.task-def-arn }}
         run: |
-          aws ecs update-service --cluster my-cluster --service my-ecs-service --task-definition $TASK_DEF_ARN --force-new-deployment
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $TASK_DEF_ARN \
+            --force-new-deployment
