@@ -1,88 +1,85 @@
-name: CI/CD Pipeline - ECS Fargate
+name: CI/CD Pipeline for ECS Fargate App
 
 on:
   push:
     branches: [ main ]
 
 env:
-  CLUSTER_NAME: my-cluster
-  SERVICE_NAME: my-ecs-service
-  TASK_FAMILY: my-ecs-task
   AWS_REGION: us-east-1
+  ECS_CLUSTER: my-cluster
+  ECS_SERVICE: my-ecs-service
+  TASK_DEFINITION: my-ecs-task
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      IMAGE_URI: ${{ steps.build-image.outputs.image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
         id: login-ecr
 
-      - name: Build, tag, and push Docker image
+      - name: Build and push Docker image
+        id: build-image
         run: |
           IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
           docker build -t $IMAGE_URI .
           docker push $IMAGE_URI
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
 
-  deploy-to-ecs:
+  deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Fetch existing task definition
+      - name: Fetch existing ECS task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.TASK_FAMILY }} \
+            --task-definition ${{ env.TASK_DEFINITION }} \
             --region ${{ env.AWS_REGION }} \
-            --output json > task-def.json
+            > task-def.json
 
-      - name: Clean task definition JSON
+      - name: Prepare updated task definition
         run: |
-          jq 'del(.taskDefinition.taskDefinitionArn, 
-                  .taskDefinition.revision, 
-                  .taskDefinition.status, 
-                  .taskDefinition.requiresAttributes, 
-                  .taskDefinition.compatibilities, 
-                  .taskDefinition.registeredAt, 
-                  .taskDefinition.registeredBy)' task-def.json > task-def-clean.json
+          jq '.taskDefinition | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > task-def-final.json
+          jq --arg IMAGE "${{ needs.build-and-push.outputs.IMAGE_URI }}" \
+            '.containerDefinitions[0].image = $IMAGE' \
+            task-def-final.json > task-def-final-updated.json
 
-      - name: Update container image
+      - name: Register updated ECS task definition
         run: |
-          jq --arg IMAGE "${{ env.IMAGE_URI }}" \
-             '.taskDefinition.containerDefinitions[0].image = $IMAGE' \
-             task-def-clean.json > task-def-final.json
+          aws ecs register-task-definition \
+            --cli-input-json file://task-def-final-updated.json \
+            --region ${{ env.AWS_REGION }}
 
-      - name: Register new task definition
+      - name: Update ECS service to use new task definition
         run: |
-          NEW_TASK_DEF=$(aws ecs register-task-definition \
-            --cli-input-json file://task-def-final.json)
-          NEW_REVISION=$(echo $NEW_TASK_DEF | jq -r '.taskDefinition.taskDefinitionArn')
-          echo "NEW_REVISION=$NEW_REVISION" >> $GITHUB_ENV
-
-      - name: Update ECS service
-        run: |
+          NEW_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_DEFINITION }} \
+            --region ${{ env.AWS_REGION }} \
+            | jq -r '.taskDefinition.taskDefinitionArn')
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER_NAME }} \
-            --service ${{ env.SERVICE_NAME }} \
-            --task-definition ${{ env.NEW_REVISION }} \
-            --force-new-deployment
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $NEW_TASK_DEF \
+            --region ${{ env.AWS_REGION }}
