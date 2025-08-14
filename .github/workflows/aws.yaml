@@ -16,7 +16,7 @@ jobs:
       - name: Run tests
         run: |
           echo "Running tests..."
-          # Add any custom test commands here
+          # Add custom test commands here
 
   docker:
     name: Build and Push Docker Image
@@ -37,7 +37,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Create ECR repository if it doesn't exist
+      - name: Create ECR repository if not exists
         run: |
           aws ecr describe-repositories --repository-names my-app || \
           aws ecr create-repository --repository-name my-app
@@ -63,9 +63,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Update ECS service
+      - name: Create ECS cluster if not exists
+        run: |
+          aws ecs describe-clusters --clusters my-cluster || \
+          aws ecs create-cluster --cluster-name my-cluster
+
+      - name: Create ECS service if not exists
+        run: |
+          SERVICE_EXISTS=$(aws ecs describe-services --cluster my-cluster --services my-ecs-service --query "services[0].status" --output text)
+          if [ "$SERVICE_EXISTS" == "None" ]; then
+            aws ecs create-service \
+              --cluster my-cluster \
+              --service-name my-ecs-service \
+              --task-definition my-ecs-task \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[subnet-xxxx],securityGroups=[sg-xxxx],assignPublicIp=ENABLED}"
+          fi
+
+      - name: Update ECS service to new image
         run: |
           aws ecs update-service \
             --cluster my-cluster \
-            --service ${{ secrets.ECS_SERVICE_NAME }} \
+            --service my-ecs-service \
             --force-new-deployment
