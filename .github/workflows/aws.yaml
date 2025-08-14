@@ -1,4 +1,4 @@
-name: Full CI/CD Pipeline
+name: CI/CD Pipeline
 
 on:
   push:
@@ -6,50 +6,46 @@ on:
       - main
 
 jobs:
-  build:
+  build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run tests
         run: |
-          echo "Running tests..."
-          # Add custom test commands here
+          pytest  # or your test command
 
   docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-and-test
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
       - name: Log in to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Create ECR repository if it doesn't exist
-        run: |
-          aws ecr describe-repositories --repository-names my-app || \
-          aws ecr create-repository --repository-name my-app
 
       - name: Build, tag, and push Docker image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: my-app
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          IMAGE_NAME: my-ecs-task
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG
 
   deploy:
     name: Deploy to ECS
@@ -63,54 +59,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Create ECS cluster if not exists
-        run: |
-          aws ecs describe-clusters --clusters my-cluster || \
-          aws ecs create-cluster --cluster-name my-cluster
-
-      - name: Register ECS task definition
-        run: |
-          cat > taskdef.json <<EOF
-          {
-            "family": "my-ecs-task",
-            "networkMode": "awsvpc",
-            "containerDefinitions": [
-              {
-                "name": "my-app",
-                "image": "${{ steps.login-ecr.outputs.registry }}/my-app:${{ github.sha }}",
-                "essential": true,
-                "portMappings": [
-                  {
-                    "containerPort": 80,
-                    "hostPort": 80
-                  }
-                ]
-              }
-            ],
-            "requiresCompatibilities": ["FARGATE"],
-            "cpu": "256",
-            "memory": "512"
-          }
-          EOF
-
-          aws ecs register-task-definition --cli-input-json file://taskdef.json
-
-      - name: Create ECS service if not exists
-        run: |
-          SERVICE_EXISTS=$(aws ecs describe-services --cluster my-cluster --services my-ecs-service --query "services[0].status" --output text)
-          if [ "$SERVICE_EXISTS" == "None" ]; then
-            aws ecs create-service \
-              --cluster my-cluster \
-              --service-name my-ecs-service \
-              --task-definition my-ecs-task \
-              --desired-count 1 \
-              --launch-type FARGATE \
-              --network-configuration "awsvpcConfiguration={subnets=[subnet-xxxx],securityGroups=[sg-xxxx],assignPublicIp=ENABLED}"
-          fi
-
-      - name: Update ECS service to new image
+      - name: Update ECS service
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+          IMAGE_NAME: my-ecs-task
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           aws ecs update-service \
             --cluster my-cluster \
             --service my-ecs-service \
-            --force-new-deployment
+            --force-new-deployment \
+            --task-definition my-ecs-task
