@@ -1,68 +1,79 @@
-
-name: CI/CD Pipeline
+name: CI/CD to AWS ECS
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  build:
-    name: Build and Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run tests
-        run: pytest
-
-  docker:
+  build-image:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: build
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Log in to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, and push image
-        env:
-          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-          ECR_REPOSITORY: my-ecs-task
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-  deploy:
-    name: Deploy to ECS
-    runs-on: ubuntu-latest
-    needs: docker
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Update ECS service
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Build, tag, and push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+          IMAGE_TAG: latest
         run: |
-          aws ecs update-service \
-            --cluster my-cluster \
-            --service my-ecs-service \
-            --force-new-deployment
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  update-task:
+    name: Update ECS Task Definition
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Register new ECS task definition
+        id: register-task
+        env:
+          IMAGE_URI: ${{ needs.build-image.outputs.image-uri }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition my-ecs-task)
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$IMAGE_URI" '.taskDefinition | .containerDefinitions[0].image=$IMAGE | {family: .family, containerDefinitions: .containerDefinitions, taskRoleArn: .taskRoleArn, executionRoleArn: .executionRoleArn, networkMode: .networkMode, requiresCompatibilities: .requiresCompatibilities, cpu: .cpu, memory: .memory}')
+          echo "$NEW_TASK_DEF" > new-task-def.json
+          aws ecs register-task-definition --cli-input-json file://new-task-def.json
+          TASK_DEF_ARN=$(aws ecs describe-task-definition --task-definition my-ecs-task --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+  deploy-service:
+    name: Deploy ECS Service
+    needs: update-task
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update ECS service to use new task definition
+        env:
+          TASK_DEF_ARN: ${{ needs.update-task.outputs.task-def-arn }}
+        run: |
+          aws ecs update-service --cluster my-cluster --service my-ecs-service --task-definition $TASK_DEF_ARN --force-new-deployment
