@@ -1,4 +1,4 @@
-name: CI/CD Pipeline for ECS Fargate App
+name: CI/CD to ECS Fargate
 
 on:
   push:
@@ -8,15 +8,16 @@ env:
   AWS_REGION: us-east-1
   ECS_CLUSTER: my-cluster
   ECS_SERVICE: my-ecs-service
-  TASK_DEFINITION: my-ecs-task
+  TASK_FAMILY: my-ecs-task
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     outputs:
-      IMAGE_URI: ${{ steps.build-image.outputs.image }}
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v3
 
       - name: Configure AWS credentials
@@ -27,22 +28,23 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
         id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build and push Docker image
+      - name: Build, tag, and push Docker image
         id: build-image
         run: |
-          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest"
           docker build -t $IMAGE_URI .
           docker push $IMAGE_URI
-          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v3
 
       - name: Configure AWS credentials
@@ -52,34 +54,30 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Fetch existing ECS task definition
+      - name: Fetch current ECS task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition ${{ env.TASK_DEFINITION }} \
-            --region ${{ env.AWS_REGION }} \
-            > task-def.json
+            --task-definition ${{ env.TASK_FAMILY }} \
+            --query "taskDefinition" > task-def.json
 
-      - name: Prepare updated task definition
+      - name: Clean unnecessary fields
         run: |
-          jq '.taskDefinition | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > task-def-final.json
-          jq --arg IMAGE "${{ needs.build-and-push.outputs.IMAGE_URI }}" \
-            '.containerDefinitions[0].image = $IMAGE' \
-            task-def-final.json > task-def-final-updated.json
+          jq '. | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > task-def-clean.json
 
-      - name: Register updated ECS task definition
+      - name: Update container image
         run: |
-          aws ecs register-task-definition \
-            --cli-input-json file://task-def-final-updated.json \
-            --region ${{ env.AWS_REGION }}
+          IMAGE_URI="${{ needs.build-and-push.outputs.image-uri }}"
+          jq --arg IMAGE "$IMAGE_URI" \
+             '.containerDefinitions[0].image = $IMAGE' \
+             task-def-clean.json > task-def-final.json
 
-      - name: Update ECS service to use new task definition
+      - name: Register updated task definition
         run: |
-          NEW_TASK_DEF=$(aws ecs describe-task-definition \
-            --task-definition ${{ env.TASK_DEFINITION }} \
-            --region ${{ env.AWS_REGION }} \
-            | jq -r '.taskDefinition.taskDefinitionArn')
+          aws ecs register-task-definition --cli-input-json file://task-def-final.json
+
+      - name: Update ECS service
+        run: |
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
-            --task-definition $NEW_TASK_DEF \
-            --region ${{ env.AWS_REGION }}
+            --force-new-deployment
