@@ -47,10 +47,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
 
-      - name: Build, tag, and push image
+      - name: Build, tag, and push Docker image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: my-app  # Replace with your ECR repository name
+          ECR_REPOSITORY: my-app       # Replace with your ECR repository name
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
@@ -66,11 +66,11 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1  # Replace with your AWS region
+          aws-region: us-east-1
 
       - name: Update ECS service
         run: |
           aws ecs update-service \
-            --cluster my-cluster \   # Replace with your ECS cluster name
-            --service my-service \   # Replace with your ECS service name
+            --cluster my-cluster \           # Replace with your ECS cluster name
+            --service my-ecs-service \       # Replace with your ECS service name
             --force-new-deployment
